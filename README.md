@@ -39,6 +39,32 @@ mid-word) and `--strip-chunks` (trim whitespace at block edges).
 | `collapse_whitespace` | false | squeeze runs of spaces/tabs into one space |
 | `remove_whitespace` | false | delete all whitespace (overrides the two above) |
 
+## Font size and fitting
+
+Text is **never cut off** by default (`overflow = "shrink"`), in either
+splitting mode. Each image gets the largest font size at which its whole
+block fits, from `max_font_size` down to as small as it takes, even below
+one pixel.
+
+- Sizes are tried 2% apart (`font_size_precision`), not in whole pixels,
+  so the text fills the page instead of leaving half of it blank.
+- Sizes under `supersample_below` (6px) are drawn several times bigger and
+  scaled down, so tiny text is an accurate miniature, not FreeType noise.
+- `min_font_size` (6px) is the smallest *readable* size. Below it the
+  script warns you before it starts, and at the end tells you how many
+  images (`--images N`), how many characters per image (`--chunk-size N`)
+  or what image size (`-x`/`-y`) would give readable text.
+- `--overflow cut` brings back the old behaviour: stop at `min_font_size`
+  and cut off whatever doesn't fit.
+- With `auto_fit_font` off, `font_size` is used whenever the text fits;
+  if it doesn't, the text still shrinks rather than being cut.
+
+How small the text gets depends only on how much text each image holds.
+For example, 19 million characters in 20 images of 1200x1600 is about a
+million characters per image, which is around 1.6px text. To be readable
+at 6px, that needs roughly 280 images, or images about 3.7x wider and
+taller.
+
 ## Speed
 
 - **All cores, any number of images.** With many images, each core
@@ -66,9 +92,6 @@ parallel, so it is several times slower than the default processes.
 
 ## Other notes
 
-- If a block doesn't fit even at `min_font_size`, the text is cut off and
-  the script lists those images at the end. Make the images bigger, lower
-  `--min-font-size`, or put less text in each image.
 - The default font (DejaVu Sans) has no Chinese/Japanese/Korean characters.
   For those, point `--font-path` at a font that does, such as Noto Sans CJK.
   For scripts that need text shaping (Arabic, Hindi...), also add

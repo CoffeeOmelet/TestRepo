@@ -34,6 +34,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
+from collections import namedtuple
 from itertools import accumulate
 from multiprocessing import shared_memory
 
@@ -94,9 +95,18 @@ DEFAULTS = {
     # Text layout
     "font_path": None,              # None = auto-detect a system font
     "font_size": 22,                # used when auto_fit_font is False
-    "auto_fit_font": True,          # pick the largest size that fits
-    "min_font_size": 6,
+                                    # (still shrinks if the text won't fit)
+    "auto_fit_font": True,          # largest size that fills the image
+    "min_font_size": 6,             # smallest readable size: warn below it
+                                    # (or cut the text here, overflow="cut")
     "max_font_size": 72,
+    "font_size_precision": 0.02,    # auto-fit tries sizes 2% apart
+    "overflow": "shrink",           # shrink = text is NEVER cut off; it gets
+                                    #          as small as it has to (<1px ok)
+                                    # cut    = stop at min_font_size, cut text
+    "supersample_below": 6,         # sizes under this (px) are drawn bigger
+                                    # and scaled down: sharp, and allows
+                                    # sub-pixel text sizes
     "line_spacing": 1.2,            # multiple of font size
     "align": "left",                # left | center | right
     "wrap_mode": "word",            # word | char
@@ -140,6 +150,10 @@ FALLBACK_FONTS = [
 
 READ_BLOCK = 1 << 22                # characters read from disk at a time
 WIDTH_CACHE_LIMIT = 500_000         # measured words kept per font size
+FONT_CACHE_LIMIT = 64               # font sizes kept in the caches
+MAX_SCALE = 64                      # most supersampling (sizes down to
+                                    # supersample_below / 64 px)
+BAND_PIXELS = 1 << 25               # max pixels drawn at once (memory cap)
 KERN_TEST_PAIRS = ("AV", "AW", "AY", "LT", "LY", "TA", "Ta", "Te", "To",
                    "VA", "Wa", "Yo", "P.", "F,", "r.", "y.")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -153,6 +167,7 @@ _SHM = None                         # whole text in shared memory (processes)
 _SHM_ENCODING = None
 _SHM_CHAR_BYTES = 1
 _PALETTE = None
+_GRID = None                        # candidate font sizes, ascending
 _WIDTHS = {}                        # font size -> {word: pixel width}
 _tls = threading.local()            # per-thread font objects
 
@@ -282,7 +297,7 @@ def resolve_font_path(path):
 def get_font(size):
     # FreeType font objects must not be shared between threads.
     fonts = getattr(_tls, "fonts", None)
-    if fonts is None:
+    if fonts is None or len(fonts) > FONT_CACHE_LIMIT:
         fonts = _tls.fonts = {}
     font = fonts.get(size)
     if font is None:
@@ -301,6 +316,8 @@ def width_table(size):
     """Measured widths at one font size, reused across every block."""
     table = _WIDTHS.get(size)
     if table is None or len(table) > WIDTH_CACHE_LIMIT:
+        if len(_WIDTHS) > FONT_CACHE_LIMIT:
+            _WIDTHS.clear()
         table = _WIDTHS[size] = {}
     return table
 
@@ -356,7 +373,7 @@ class GlyphPainter:
 
 def get_painter(size):
     painters = getattr(_tls, "painters", None)
-    if painters is None:
+    if painters is None or len(painters) > FONT_CACHE_LIMIT:
         painters = _tls.painters = {}
     painter = painters.get(size)
     if painter is None:
@@ -382,8 +399,42 @@ def box_size(cfg):
             cfg["height"] - cfg["margin_top"] - cfg["margin_bottom"])
 
 
-def line_height(size):
-    return max(1, round(size * _CFG["line_spacing"]))
+# A layout at one font size. Sizes below supersample_below are laid out and
+# drawn `scale` times bigger (at `render` px, on a canvas `scale` times
+# bigger) and then shrunk, so text can be any size, even under a pixel.
+# lh, box_w and box_h are in the scaled-up pixels.
+Spec = namedtuple("Spec", "size scale render lh box_w box_h")
+
+
+def make_spec(size):
+    cfg = _CFG
+    floor = cfg["supersample_below"]
+    scale = (1 if size >= floor
+             else min(MAX_SCALE, math.ceil(floor / size - 1e-9)))
+    render = round(size * scale, 4)
+    box_w, box_h = box_size(cfg)
+    lh = max(1.0, render * cfg["line_spacing"])   # fractional is fine
+    return Spec(size, scale, render, lh, box_w * scale, box_h * scale)
+
+
+def size_grid():
+    """Every font size auto-fit may pick, ascending, font_size_precision
+    apart, from the largest allowed size down to the smallest."""
+    global _GRID
+    if _GRID is None:
+        cfg = _CFG
+        top = cfg["max_font_size"] if cfg["auto_fit_font"] else cfg["font_size"]
+        if cfg["overflow"] == "cut":
+            floor = cfg["min_font_size"] if cfg["auto_fit_font"] else top
+        else:
+            floor = cfg["supersample_below"] / MAX_SCALE
+        floor = min(floor, top)
+        sizes, size = {round(floor, 4)}, top
+        while size > floor:
+            sizes.add(round(size, 4))
+            size /= 1 + cfg["font_size_precision"]
+        _GRID = sorted(sizes)
+    return _GRID
 
 
 # --------------------------------------------------------------------------
@@ -442,15 +493,14 @@ def wrap_words(text, start, end, font, max_width, table, out, limit):
     return False
 
 
-def wrap(text, size):
-    """Wrap a block at one font size. Returns (offsets, overflowed); stops
-    as soon as the image is full."""
-    cfg = _CFG
-    font = get_font(size)
-    table = width_table(size)
-    box_w, box_h = box_size(cfg)
-    limit = 2 * (box_h // line_height(size))
-    breaker = wrap_words if cfg["wrap_mode"] == "word" else break_run
+def wrap(text, spec):
+    """Wrap a block at one layout. Returns (offsets, overflowed); stops as
+    soon as the image is full."""
+    font = get_font(spec.render)
+    table = width_table(spec.render)
+    limit = 2 * int(spec.box_h // spec.lh)
+    max_width = spec.box_w
+    breaker = wrap_words if _CFG["wrap_mode"] == "word" else break_run
     out = []
     pos = 0
     while True:
@@ -460,7 +510,7 @@ def wrap(text, size):
             if len(out) >= limit:
                 return out, True
             out += (pos, pos)
-        elif breaker(text, pos, end, font, box_w, table, out, limit):
+        elif breaker(text, pos, end, font, max_width, table, out, limit):
             return out, True
         if nl < 0:
             return out, False
@@ -468,71 +518,72 @@ def wrap(text, size):
 
 
 def guess_size(text):
-    """Estimate the font size that fills the box, so the search usually
-    needs 2 wraps instead of ~7."""
+    """Estimate (px) of the font size that just fills the box."""
     cfg = _CFG
-    lo, hi = cfg["min_font_size"], cfg["max_font_size"]
     sample = text[:4096].replace("\n", " ")
     if not sample.strip():
-        return hi
+        return cfg["max_font_size"]
     table = width_table(100)
     measure_missing(sample, table, get_font(100))
     per_char = sum(map(table.__getitem__, sample)) / len(sample) / 100
     if per_char <= 0:
-        return hi
+        return cfg["max_font_size"]
     box_w, box_h = box_size(cfg)
-    est = math.sqrt(box_w * box_h /
-                    (len(text) * per_char * cfg["line_spacing"] * 1.08))
-    return max(lo, min(hi, int(est)))
+    return math.sqrt(box_w * box_h /
+                     (len(text) * per_char * cfg["line_spacing"] * 1.08))
+
+
+def guess_level(text):
+    grid = size_grid()
+    return max(0, bisect_right(grid, guess_size(text)) - 1)
 
 
 def choose_layout(text):
     """Largest font size whose wrapped text fits. Returns
-    (size, offsets, fits)."""
-    cfg = _CFG
-    if not cfg["auto_fit_font"]:
-        size = cfg["font_size"]
-        offsets, over = wrap(text, size)
-        return size, offsets, not over
-
-    lo, hi = cfg["min_font_size"], cfg["max_font_size"]
-    probe = guess_size(text)
-    tried, best, first = {}, None, True
+    (spec, offsets, fits). Starts at an estimate and gallops outward
+    (1, 2, 4... sizes) until the answer is bracketed, then bisects, so it
+    usually needs only a few wraps."""
+    grid = size_grid()
+    tried = {}
+    lo, hi, best, failed = 0, len(grid) - 1, None, False
+    level, step = guess_level(text), 1
     while lo <= hi:
-        mid = probe if probe is not None and lo <= probe <= hi else (lo + hi) // 2
-        offsets, over = wrap(text, mid)
-        tried[mid] = offsets
+        level = min(max(level, lo), hi)
+        offsets, over = wrap(text, make_spec(grid[level]))
+        tried[level] = offsets
         if over:
-            hi = mid - 1
+            hi, failed, direction = level - 1, True, -1
         else:
-            best, lo = mid, mid + 1
-        # Right after the estimate, check its neighbour; then bisect.
-        probe = (mid - 1 if over else mid + 1) if first else None
-        first = False
-    if best is None:
-        size = cfg["min_font_size"]
-        return size, tried[size], False
-    return best, tried[best], True
+            best, lo, direction = level, level + 1, 1
+        if best is not None and failed:
+            level = (lo + hi) // 2
+        else:
+            level += direction * step
+            step *= 2
+    # Nothing fit even at the smallest size: only possible with
+    # overflow="cut" (or absurd amounts of text); the text is cut off.
+    level = 0 if best is None else best
+    return make_spec(grid[level]), tried[level], best is not None
 
 
 # --------------------------------------------------------------------------
 # Drawing and PNG output
 # --------------------------------------------------------------------------
-def draw_lines(img, text, offsets, first_line, size, x_shift=0, y_shift=0):
+def draw_lines(img, text, offsets, first_line, spec, x_shift=0, y_shift=0):
     cfg = _CFG
-    font = get_font(size)
-    lh = line_height(size)
-    box_w = box_size(cfg)[0]
+    s = spec.scale
+    font = get_font(spec.render)
+    lh, box_w = spec.lh, spec.box_w
     align = cfg["align"]
     draw = ImageDraw.Draw(img)
     if (cfg["glyph_cache"] and cfg["layout_engine"] == "basic"
             and isinstance(font, ImageFont.FreeTypeFont)):
-        paint, core_draw = get_painter(size).paint, draw.draw
+        paint, core_draw = get_painter(spec.render).paint, draw.draw
         put = lambda x, y, line: paint(core_draw, x, y, line)
     else:
         put = lambda x, y, line: draw.text((x, y), line, fill=255, font=font)
-    x0 = cfg["margin_left"] + x_shift
-    y = cfg["margin_top"] + first_line * lh - y_shift
+    x0 = cfg["margin_left"] * s + x_shift
+    top = cfg["margin_top"] * s - y_shift
     for k in range(0, len(offsets), 2):
         line = text[offsets[k]:offsets[k + 1]]
         if line and not line.isspace():
@@ -540,8 +591,48 @@ def draw_lines(img, text, offsets, first_line, size, x_shift=0, y_shift=0):
             if align != "left":
                 extra = box_w - font.getlength(line)
                 x += extra if align == "right" else extra / 2
-            put(x, y, line)
-        y += lh
+            # Each line's row comes from its index, so a band and the whole
+            # image put it on exactly the same row.
+            put(x, round(top + (first_line + k // 2) * lh), line)
+
+
+def band_lines(spec, y0, y1, nlines):
+    """Lines that can touch output rows y0..y1. Glyphs can reach outside
+    their line box, so the neighbouring lines are included too."""
+    s, lh = spec.scale, spec.lh
+    top = _CFG["margin_top"] * s
+    i0 = math.floor((y0 * s - top - lh - 2 * spec.render) / lh)
+    i1 = math.floor((y1 * s - top + spec.render) / lh) + 1
+    return max(0, i0), min(nlines, max(0, i1))
+
+
+def band_bounds(spec, min_bands=1):
+    """Split the output rows into bands small enough to draw in memory."""
+    cfg = _CFG
+    W, H, s = cfg["width"], cfg["height"], spec.scale
+    n = max(min_bands, -(-(W + 1) * s * H * s // BAND_PIXELS))
+    n = min(n, H)
+    return [H * b // n for b in range(n + 1)]
+
+
+def render_rows(text, offsets, first_line, spec, y0, y1, extra_col=0):
+    """Output rows y0..y1 as an L image of text coverage (0..255). With
+    supersampling it is drawn spec.scale times bigger and box-filtered down,
+    which matches drawing the whole image at once exactly."""
+    cfg = _CFG
+    s = spec.scale
+    img = Image.new("L", ((cfg["width"] + extra_col) * s, (y1 - y0) * s), 0)
+    i0, i1 = band_lines(spec, y0, y1, first_line + len(offsets) // 2)
+    i0 = max(i0, first_line)
+    if i0 < i1:
+        a, b = 2 * (i0 - first_line), 2 * (i1 - first_line)
+        draw_lines(img, text, offsets[a:b], i0, spec,
+                   x_shift=extra_col * s, y_shift=y0 * s)
+    if s > 1:
+        img = img.reduce(s)
+    if extra_col:
+        img.paste(0, (0, 0, extra_col, img.height))
+    return img
 
 
 def output_path(index):
@@ -599,20 +690,25 @@ def task_image(index, start, end):
     """per-image strategy: one whole image."""
     cfg = _CFG
     text = text_slice(start, end)
-    size, offsets, fits = choose_layout(text)
-    img = Image.new("L", (cfg["width"], cfg["height"]), 0)
-    draw_lines(img, text, offsets, 0, size)
+    spec, offsets, fits = choose_layout(text)
+    bounds = band_bounds(spec)
+    if len(bounds) == 2:
+        img = render_rows(text, offsets, 0, spec, 0, cfg["height"])
+    else:
+        img = Image.new("L", (cfg["width"], cfg["height"]), 0)
+        for y0, y1 in zip(bounds, bounds[1:]):
+            img.paste(render_rows(text, offsets, 0, spec, y0, y1), (0, y0))
     img.putpalette(get_palette())   # L -> P, the values become indices
     img.save(output_path(index), "PNG",
              compress_level=cfg["png_compress_level"])
-    return index, size, fits
+    return index, spec.size, fits, end - start
 
 
-def task_fit(start, end, size, floor):
+def task_fit(start, end, level):
     """split strategy: does the block fit at this font size?"""
-    offsets, over = wrap(text_slice(start, end), size)
-    keep = not over or size == floor
-    return size, not over, array("I", offsets).tobytes() if keep else b""
+    offsets, over = wrap(text_slice(start, end), make_spec(size_grid()[level]))
+    keep = not over or level == 0
+    return level, not over, array("I", offsets).tobytes() if keep else b""
 
 
 def task_band(start, size, y0, y1, first_line, offsets_bytes, final):
@@ -620,16 +716,16 @@ def task_band(start, size, y0, y1, first_line, offsets_bytes, final):
     cfg = _CFG
     offsets = array("I")
     offsets.frombytes(offsets_bytes)
-    rows = y1 - y0
-    # One extra column on the left holds each row's PNG filter byte (0), so
-    # tobytes() is already valid PNG scanline data.
-    img = Image.new("L", (cfg["width"] + 1, rows), 0)
     if offsets:
         a = offsets[0]
         text = text_slice(start + a, start + offsets[-1])
-        draw_lines(img, text, [o - a for o in offsets], first_line, size,
-                   x_shift=1, y_shift=y0)
-        img.paste(0, (0, 0, 1, rows))
+        offsets = [o - a for o in offsets]
+    else:
+        text = ""
+    # One extra column on the left holds each row's PNG filter byte (0), so
+    # tobytes() is already valid PNG scanline data.
+    img = render_rows(text, offsets, first_line, make_spec(size), y0, y1,
+                      extra_col=1)
     raw = img.tobytes()
     comp = zlib.compressobj(cfg["png_compress_level"], zlib.DEFLATED, -15, 9)
     data = comp.compress(raw) + comp.flush(
@@ -708,7 +804,7 @@ class Progress:
 def run_per_image(pool, chunks, cfg, progress, workers):
     jobs = enumerate(chunks, start=cfg["start_index"])
     window = workers * max(1, cfg["max_pending_factor"])
-    pending, overflowed, done = set(), [], 0
+    pending, results = set(), []
 
     def fill():
         for index, (start, end) in jobs:
@@ -720,113 +816,103 @@ def run_per_image(pool, chunks, cfg, progress, workers):
     while pending:
         finished, _ = wait(pending, return_when=FIRST_COMPLETED)
         pending.difference_update(finished)
-        for fut in finished:
-            index, size, fits = fut.result()
-            done += 1
-            if not fits:
-                overflowed.append((index, size))
+        results.extend(fut.result() for fut in finished)
         fill()
-        progress.update(done, len(pending))
-    return done, overflowed
+        progress.update(len(results), len(pending))
+    return results
 
 
 class Job:
-    """One image in the split strategy."""
-    __slots__ = ("index", "start", "end", "lo", "hi", "floor", "best",
-                 "probe", "inflight", "tried", "results", "size", "fits",
-                 "bands", "bands_left")
+    """One image in the split strategy. lo..hi is the range of font size
+    levels (indices into size_grid()) still in question."""
+    __slots__ = ("index", "start", "end", "lo", "hi", "best", "failed",
+                 "probe", "step", "inflight", "results", "spec", "fits",
+                 "bands", "bands_left", "nbands")
 
-    def __init__(self, index, start, end, lo, hi, floor, probe):
+    def __init__(self, index, start, end, top, probe):
         self.index, self.start, self.end = index, start, end
-        self.lo, self.hi, self.floor, self.probe = lo, hi, floor, probe
-        self.best = self.size = self.fits = self.bands = None
-        self.inflight, self.bands_left = 0, 0
-        self.tried, self.results = set(), {}
+        self.lo, self.hi, self.probe = 0, top, probe
+        self.best = self.spec = self.fits = self.bands = None
+        self.failed = False
+        self.step, self.inflight, self.bands_left, self.nbands = 1, 0, 0, 1
+        self.results = {}
 
 
 def run_split(pool, chunks, cfg, text, progress, workers):
-    """Few images: search font sizes in parallel, then draw and compress
+    """Few images: try several font sizes at once, then draw and compress
     each image as horizontal bands on all cores."""
     W, H = cfg["width"], cfg["height"]
     palette = get_palette()
-    nbands = max(1, min(-(-workers * cfg["tasks_per_worker"] // len(chunks)),
-                        H // 8))
-    bounds = [H * b // nbands for b in range(nbands + 1)]
+    grid = size_grid()
+    min_bands = max(1, min(-(-workers * cfg["tasks_per_worker"]
+                             // len(chunks)), H // 8))
     max_probes = 8
 
-    jobs = []
-    for index, (start, end) in enumerate(chunks, start=cfg["start_index"]):
-        if cfg["auto_fit_font"]:
-            lo, hi = cfg["min_font_size"], cfg["max_font_size"]
-            probe = guess_size(text[start:end])
-            jobs.append(Job(index, start, end, lo, hi, lo, probe))
-        else:
-            fs = cfg["font_size"]
-            jobs.append(Job(index, start, end, fs, fs, fs, fs))
-
+    jobs = [Job(index, start, end, len(grid) - 1,
+                guess_level(text[start:end]))
+            for index, (start, end) in enumerate(chunks,
+                                                 start=cfg["start_index"])]
     futures = {}
     searching = len(jobs)
-    state = {"done": 0.0, "images": 0}
-    overflowed = []
+    state = {"done": 0.0}
+    results = []
 
     def submit_fits(job):
         k = max(1, min(max_probes, workers // max(1, searching)))
         lo, hi = job.lo, job.hi
-        if job.probe is not None:       # first round: around the estimate
+        if job.probe is not None:           # first: around the estimate
             c, job.probe = job.probe, None
             cands = [c + d for d in range(-((k - 1) // 2), k - (k - 1) // 2)]
-        else:                           # then: spread across what's left
+        elif job.best is not None and job.failed:   # bracketed: bisect
             span = hi - lo + 1
             cands = (range(lo, hi + 1) if span <= k else
                      [lo + span * (i + 1) // (k + 1) for i in range(k)])
-        sizes = sorted({s for s in cands
-                        if lo <= s <= hi and s not in job.tried})
-        if not sizes:
-            sizes = [(lo + hi) // 2]
-        for size in sizes:
-            job.tried.add(size)
+        else:                               # gallop up or down
+            up = job.best is not None
+            base = job.best if up else hi + 1
+            cands = [base + (1 if up else -1) * job.step * (i + 1)
+                     for i in range(k)]
+            job.step *= k + 1
+        levels = sorted({min(max(c, lo), hi) for c in cands})
+        for level in levels:
             job.inflight += 1
-            fut = pool.submit(task_fit, job.start, job.end, size, job.floor)
+            fut = pool.submit(task_fit, job.start, job.end, level)
             futures[fut] = ("fit", job, None)
 
     def resolve(job):
         nonlocal searching
         searching -= 1
-        job.size = job.best if job.best is not None else job.floor
+        level = job.best if job.best is not None else 0
+        spec = job.spec = make_spec(grid[level])
         job.fits = job.best is not None
         offsets = array("I")
-        offsets.frombytes(job.results[job.size])
-        job.results = job.tried = None
-        if not job.fits:
-            overflowed.append((job.index, job.size))
+        offsets.frombytes(job.results[level])
+        job.results = None
+        results.append((job.index, spec.size, job.fits, job.end - job.start))
         nlines = len(offsets) // 2
-        lh = line_height(job.size)
-        mt = cfg["margin_top"]
-        # Glyphs can poke above/below their line box; give every band the
-        # neighbouring lines too so nothing is clipped at band edges.
-        ext_top, ext_bottom = job.size, lh + 2 * job.size
-        job.bands = [None] * nbands
-        job.bands_left = nbands
-        for b in range(nbands):
+        bounds = band_bounds(spec, min_bands)
+        job.nbands = job.bands_left = len(bounds) - 1
+        job.bands = [None] * job.nbands
+        for b in range(job.nbands):
             y0, y1 = bounds[b], bounds[b + 1]
-            i0 = max(0, (y0 - mt - ext_bottom) // lh)
-            i1 = min(nlines, max(0, (y1 - mt + ext_top) // lh + 1))
+            i0, i1 = band_lines(spec, y0, y1, nlines)
             sub = offsets[2 * i0:2 * i1].tobytes() if i0 < i1 else b""
-            fut = pool.submit(task_band, job.start, job.size, y0, y1, i0,
-                              sub, b == nbands - 1)
+            fut = pool.submit(task_band, job.start, spec.size, y0, y1, i0,
+                              sub, b == job.nbands - 1)
             futures[fut] = ("band", job, b)
 
-    def on_fit(job, size, fits, payload):
+    def on_fit(job, level, fits, payload):
         job.inflight -= 1
-        if job.size is not None:        # already decided
+        if job.spec is not None:            # already decided
             return
         if payload:
-            job.results[size] = payload
+            job.results[level] = payload
         if fits:
-            job.best = size if job.best is None else max(job.best, size)
-            job.lo = max(job.lo, size + 1)
+            job.best = level if job.best is None else max(job.best, level)
+            job.lo = max(job.lo, level + 1)
         else:
-            job.hi = min(job.hi, size - 1)
+            job.hi = min(job.hi, level - 1)
+            job.failed = True
         if job.lo > job.hi:
             resolve(job)
         elif job.inflight == 0:
@@ -835,11 +921,10 @@ def run_split(pool, chunks, cfg, text, progress, workers):
     def on_band(job, b, result):
         job.bands[b] = result
         job.bands_left -= 1
-        state["done"] += 1 / nbands
+        state["done"] += 1 / job.nbands
         if job.bands_left == 0:
             write_banded_png(output_path(job.index), W, H, palette, job.bands)
             job.bands = None
-            state["images"] += 1
 
     for job in jobs:
         submit_fits(job)
@@ -852,7 +937,7 @@ def run_split(pool, chunks, cfg, text, progress, workers):
             else:
                 on_band(job, band, fut.result())
         progress.update(state["done"], len(futures))
-    return state["images"], overflowed
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -875,7 +960,10 @@ CHOICES = {
     "layout_engine": ["basic", "raqm"],
     "executor": ["process", "thread"],
     "strategy": ["auto", "per-image", "split"],
+    "overflow": ["shrink", "cut"],
 }
+FLOAT_KEYS = {"font_size", "min_font_size", "max_font_size",
+              "supersample_below"}
 
 
 class ImagesAction(argparse.Action):
@@ -895,6 +983,8 @@ def parse_args():
         if isinstance(default, bool):
             kwargs.update(type=str2bool, nargs="?", const=True,
                           metavar="BOOL")
+        elif key in FLOAT_KEYS:
+            kwargs["type"] = float
         elif isinstance(default, int):
             kwargs["type"] = int
         elif isinstance(default, float):
@@ -925,10 +1015,12 @@ def validate(cfg):
         errors.append("width must be larger than left + right margins")
     if cfg["height"] <= cfg["margin_top"] + cfg["margin_bottom"]:
         errors.append("height must be larger than top + bottom margins")
-    if not 1 <= cfg["min_font_size"] <= cfg["max_font_size"]:
-        errors.append("need 1 <= min_font_size <= max_font_size")
-    if cfg["font_size"] < 1:
-        errors.append("font_size must be >= 1")
+    if not 0 < cfg["min_font_size"] <= cfg["max_font_size"]:
+        errors.append("need 0 < min_font_size <= max_font_size")
+    if cfg["font_size"] <= 0 or cfg["supersample_below"] <= 0:
+        errors.append("font_size and supersample_below must be > 0")
+    if not 0 < cfg["font_size_precision"] <= 1:
+        errors.append("font_size_precision must be in (0, 1]")
     if cfg["line_spacing"] <= 0:
         errors.append("line_spacing must be > 0")
     if not 0 <= cfg["png_compress_level"] <= 9:
@@ -975,10 +1067,12 @@ def main():
     else:
         split = (f"{cfg['chunk_size']:,} characters per image -> "
                  f"{len(chunks):,} images")
-    if cfg["auto_fit_font"]:
-        sizing = f"auto-fit {cfg['min_font_size']}-{cfg['max_font_size']}px"
-    else:
-        sizing = f"{cfg['font_size']}px"
+    top = cfg["max_font_size"] if cfg["auto_fit_font"] else cfg["font_size"]
+    sizing = (f"auto-fit up to {top:g}px" if cfg["auto_fit_font"]
+              else f"{top:g}px")
+    sizing += (", shrinks as needed, never cuts text"
+               if cfg["overflow"] == "shrink"
+               else f", cuts text below {cfg['min_font_size']:g}px")
     kind = "processes" if cfg["executor"] == "process" else "threads"
 
     print(f"Input:    {cfg['input_file']}")
@@ -993,6 +1087,15 @@ def main():
     if cfg["executor"] == "thread":
         print("          (threads share one Python interpreter lock; "
               "--executor process is faster)")
+    # Warn up front if the text is too dense to be readable.
+    s0, e0 = max(chunks, key=lambda c: c[1] - c[0])
+    estimate = min(top, guess_size(text[s0:e0]))
+    if estimate < cfg["min_font_size"]:
+        fate = ("it will not be cut off" if cfg["overflow"] == "shrink"
+                else "the rest will be cut off")
+        print(f"Warning:  {e0 - s0:,} characters won't fit in "
+              f"{cfg['width']}x{cfg['height']} at a readable size. Expect "
+              f"text around {estimate:.2g}px tall ({fate}).")
     sys.stdout.flush()
 
     os.makedirs(cfg["output_dir"], exist_ok=True)
@@ -1011,14 +1114,15 @@ def main():
         with pool:
             try:
                 if strategy == "split":
-                    done, overflowed = run_split(pool, chunks, cfg, text,
-                                                 progress, workers)
+                    results = run_split(pool, chunks, cfg, text, progress,
+                                        workers)
                 else:
-                    done, overflowed = run_per_image(pool, chunks, cfg,
-                                                     progress, workers)
+                    results = run_per_image(pool, chunks, cfg, progress,
+                                            workers)
             except KeyboardInterrupt:
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
+        done = len(results)
         progress.close(done)
     finally:
         if shm is not None:
@@ -1028,15 +1132,41 @@ def main():
     elapsed = time.perf_counter() - start
     print(f"Done: {done:,} images in {elapsed:.2f}s "
           f"({done / elapsed:,.1f} images/s)")
-    if overflowed:
-        overflowed.sort()
-        shown = ", ".join(f"{i} ({s}px)" for i, s in overflowed[:10])
-        more = (f" and {len(overflowed) - 10:,} more"
-                if len(overflowed) > 10 else "")
-        print(f"{len(overflowed):,} image(s) were cut off even at the "
-              f"smallest font size: {shown}{more}.")
-        print("Make the images bigger, lower --min-font-size, or put less "
-              "text in each image.")
+    report(results, len(text), cfg)
+
+
+def report(results, total_chars, cfg):
+    """Explain any images whose text is cut off or too small to read."""
+    W, H, readable = cfg["width"], cfg["height"], cfg["min_font_size"]
+    sizes = sorted(size for _, size, _, _ in results)
+    print(f"Font sizes used: {sizes[0]:.3g}px to {sizes[-1]:.3g}px "
+          f"(median {sizes[len(sizes) // 2]:.3g}px)")
+    cut = sorted(index for index, _, fits, _ in results if not fits)
+    if cut:
+        shown = ", ".join(map(str, cut[:10]))
+        more = f" and {len(cut) - 10:,} more" if len(cut) > 10 else ""
+        print(f"{len(cut):,} image(s) had text cut off: {shown}{more}. "
+              f"Use --overflow shrink to never cut text.")
+    small = [(size, n) for _, size, _, n in results if size < readable]
+    if not small:
+        return
+    # Text area scales with size squared: an image holding n characters
+    # at `size` px holds about n * (size / readable)^2 at the readable size.
+    per_image = sum(n * (size / readable) ** 2 for size, n in small) / len(small)
+    images = math.ceil(total_chars / max(1.0, per_image))
+    grow = readable / min(size for size, _ in small)
+    print(f"{len(small):,} image(s) have text smaller than "
+          f"{readable:g}px (smallest {min(size for size, _ in small):.2g}px), "
+          f"too small to read.")
+    if cfg["split_mode"] == "count":
+        fewer = f"about {images:,} images (--images {images})"
+    else:
+        chunk = max(1, int(per_image))
+        fewer = (f"about {chunk:,} characters per image "
+                 f"(--chunk-size {chunk})")
+    print(f"For {readable:g}px text, use {fewer}, or images about "
+          f"{grow:.1f}x wider and taller "
+          f"(-x {round(W * grow)} -y {round(H * grow)}).")
 
 
 if __name__ == "__main__":
