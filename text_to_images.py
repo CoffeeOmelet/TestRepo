@@ -150,6 +150,10 @@ FALLBACK_FONTS = [
 
 READ_BLOCK = 1 << 22                # characters read from disk at a time
 WIDTH_CACHE_LIMIT = 500_000         # measured words kept per font size
+REF_SIZE = 1000                     # widths are measured at this size and
+                                    # scaled, so layout is exactly
+                                    # proportional at every font size
+LONG_WORD = 1000                    # longer words are measured per character
 FONT_CACHE_LIMIT = 64               # font sizes kept in the caches
 MAX_SCALE = 64                      # most supersampling (sizes down to
                                     # supersample_below / 64 px)
@@ -168,7 +172,7 @@ _SHM_ENCODING = None
 _SHM_CHAR_BYTES = 1
 _PALETTE = None
 _GRID = None                        # candidate font sizes, ascending
-_WIDTHS = {}                        # font size -> {word: pixel width}
+_WIDTHS = {}                        # word/char -> width at REF_SIZE
 _tls = threading.local()            # per-thread font objects
 
 
@@ -312,14 +316,11 @@ def get_font(size):
     return font
 
 
-def width_table(size):
-    """Measured widths at one font size, reused across every block."""
-    table = _WIDTHS.get(size)
-    if table is None or len(table) > WIDTH_CACHE_LIMIT:
-        if len(_WIDTHS) > FONT_CACHE_LIMIT:
-            _WIDTHS.clear()
-        table = _WIDTHS[size] = {}
-    return table
+def width_table():
+    """Widths at REF_SIZE, shared by every font size and every block."""
+    if len(_WIDTHS) > WIDTH_CACHE_LIMIT:
+        _WIDTHS.clear()
+    return _WIDTHS
 
 
 def measure_missing(items, table, font):
@@ -328,29 +329,41 @@ def measure_missing(items, table, font):
 
 
 class GlyphPainter:
-    """Draws text by stamping cached per-character bitmaps. FreeType
+    """Draws text by stamping cached per-character bitmaps: FreeType
     renders each distinct character once per font size instead of once per
-    occurrence. Real kerning (>= half a pixel) is applied pair by pair."""
+    occurrence. Characters are placed using the same proportional widths
+    (and kerning) that the line wrapping measured, so lines come out
+    exactly as wide as the layout expects at every size. (FreeType's own
+    spacing rounds each character to whole pixels, which is off by up to
+    ~5% at small sizes.)"""
 
     def __init__(self, size):
-        font = self.font = get_font(size)
-        self.ascent = font.getmetrics()[0]
+        self.font = get_font(size)
+        self.ref = get_font(REF_SIZE)
+        self.scale = size / REF_SIZE
+        self.ascent = self.font.getmetrics()[0]
         self.glyphs = {}
+        # Only track kerning if the font has any worth the lookups.
+        ref = self.ref
         self.kerns = {} if any(
-            abs(font.getlength(p) - font.getlength(p[0])
-                - font.getlength(p[1])) >= 0.5
-            for p in KERN_TEST_PAIRS) else None
+            abs(ref.getlength(p) - ref.getlength(p[0]) - ref.getlength(p[1]))
+            >= REF_SIZE / 100 for p in KERN_TEST_PAIRS) else None
 
     def load(self, ch):
         mask, (ox, oy) = self.font.getmask2(ch, "L", anchor="ls")
         if not (mask.size[0] and mask.size[1]):
             mask = None
-        glyph = self.glyphs[ch] = (mask, ox, oy, self.font.getlength(ch))
+        table = width_table()
+        if ch not in table:
+            table[ch] = self.ref.getlength(ch)
+        glyph = self.glyphs[ch] = (mask, ox, oy, table[ch] * self.scale)
         return glyph
 
     def kern(self, pair):
-        k = self.font.getlength(pair) - sum(map(self.font.getlength, pair))
-        k = self.kerns[pair] = k if abs(k) >= 0.5 else 0.0
+        ref = self.ref
+        k = (ref.getlength(pair) - ref.getlength(pair[0])
+             - ref.getlength(pair[1])) * self.scale
+        self.kerns[pair] = k
         return k
 
     def paint(self, core_draw, x, y, line):
@@ -463,15 +476,31 @@ def break_run(text, start, end, font, max_width, table, out, limit):
     return False
 
 
+def word_widths(words, table, font):
+    """Pixel width of every word. Very long "words" (text with few or no
+    spaces, e.g. after remove_whitespace) are summed from character widths:
+    Pillow refuses to measure strings over 1,000,000 characters, and
+    caching huge strings would waste memory."""
+    huge = {}
+    for word in set(words).difference(table):
+        if len(word) > LONG_WORD:
+            measure_missing(word, table, font)
+            huge[word] = sum(map(table.__getitem__, word))
+        else:
+            table[word] = font.getlength(word)
+    if not huge:
+        return map(table.__getitem__, words)
+    return [huge[w] if w in huge else table[w] for w in words]
+
+
 def wrap_words(text, start, end, font, max_width, table, out, limit):
     """Word-wrap text[start:end] (one paragraph)."""
     words = text[start:end].split(" ")
-    measure_missing(words, table, font)
+    widths = word_widths(words, table, font)
     space = table[" "] if " " in table else table.setdefault(
         " ", font.getlength(" "))
     # prefix[k]: width of words[:k], each followed by a space.
-    prefix = [0.0, *accumulate(map(space.__add__,
-                                   map(table.__getitem__, words)))]
+    prefix = [0.0, *accumulate(map(space.__add__, widths))]
     # starts[k]: text offset where words[k] begins.
     starts = list(accumulate(map((1).__add__, map(len, words)),
                              initial=start))
@@ -496,10 +525,10 @@ def wrap_words(text, start, end, font, max_width, table, out, limit):
 def wrap(text, spec):
     """Wrap a block at one layout. Returns (offsets, overflowed); stops as
     soon as the image is full."""
-    font = get_font(spec.render)
-    table = width_table(spec.render)
+    font = get_font(REF_SIZE)           # measure at the reference size...
+    table = width_table()
     limit = 2 * int(spec.box_h // spec.lh)
-    max_width = spec.box_w
+    max_width = spec.box_w * REF_SIZE / spec.render   # ...in its units
     breaker = wrap_words if _CFG["wrap_mode"] == "word" else break_run
     out = []
     pos = 0
@@ -523,9 +552,9 @@ def guess_size(text):
     sample = text[:4096].replace("\n", " ")
     if not sample.strip():
         return cfg["max_font_size"]
-    table = width_table(100)
-    measure_missing(sample, table, get_font(100))
-    per_char = sum(map(table.__getitem__, sample)) / len(sample) / 100
+    table = width_table()
+    measure_missing(sample, table, get_font(REF_SIZE))
+    per_char = sum(map(table.__getitem__, sample)) / len(sample) / REF_SIZE
     if per_char <= 0:
         return cfg["max_font_size"]
     box_w, box_h = box_size(cfg)
@@ -580,8 +609,11 @@ def draw_lines(img, text, offsets, first_line, spec, x_shift=0, y_shift=0):
             and isinstance(font, ImageFont.FreeTypeFont)):
         paint, core_draw = get_painter(spec.render).paint, draw.draw
         put = lambda x, y, line: paint(core_draw, x, y, line)
+        ref, ratio = get_font(REF_SIZE), spec.render / REF_SIZE
+        measure = lambda line: ref.getlength(line) * ratio
     else:
         put = lambda x, y, line: draw.text((x, y), line, fill=255, font=font)
+        measure = font.getlength
     x0 = cfg["margin_left"] * s + x_shift
     top = cfg["margin_top"] * s - y_shift
     for k in range(0, len(offsets), 2):
@@ -589,7 +621,7 @@ def draw_lines(img, text, offsets, first_line, spec, x_shift=0, y_shift=0):
         if line and not line.isspace():
             x = x0
             if align != "left":
-                extra = box_w - font.getlength(line)
+                extra = box_w - measure(line)
                 x += extra if align == "right" else extra / 2
             # Each line's row comes from its index, so a band and the whole
             # image put it on exactly the same row.

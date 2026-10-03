@@ -47,7 +47,10 @@ block fits, from `max_font_size` down to as small as it takes, even below
 one pixel.
 
 - Sizes are tried 2% apart (`font_size_precision`), not in whole pixels,
-  so the text fills the page instead of leaving half of it blank.
+  so the text fills the page (typically 96-99% of its height) instead of
+  leaving half of it blank.
+- Any amount of text works, including millions of characters with no
+  spaces (e.g. after `--remove-whitespace`).
 - Sizes under `supersample_below` (6px) are drawn several times bigger and
   scaled down, so tiny text is an accurate miniature, not FreeType noise.
 - `min_font_size` (6px) is the smallest *readable* size. Below it the
@@ -75,7 +78,11 @@ taller.
   Force one with `--strategy per-image` or `--strategy split`.
 - **Glyph cache.** Each character is rendered by FreeType once per font
   size and then stamped wherever it appears: about 20x faster than
-  drawing text normally, with identical pixels (kerning included).
+  drawing text normally.
+- **Exact proportional spacing.** Character widths are measured once at a
+  large reference size and scaled, so layout is accurate at every size.
+  FreeType's own spacing rounds every character to whole pixels, which is
+  off by up to 5% at small sizes and made auto-fit leave gaps.
 - **Fast layout.** Word widths are measured once and reused across images,
   line breaks come from a binary search instead of re-measuring text, and
   the font size search starts from an estimate, so it usually needs 2
